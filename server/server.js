@@ -1,158 +1,102 @@
 import 'dotenv/config';
 import express from 'express';
 import http from 'http';
+import crypto from 'crypto';
 import { Server } from 'socket.io';
 
 const app = express();
 const httpServer = http.createServer(app);
-
 const PORT = process.env.PORT || 3000;
 const FRONTEND_URL = process.env.FRONTEND_URL || '*';
-const corsOrigin = FRONTEND_URL === '*'
-  ? '*'
-  : FRONTEND_URL.split(',').map((value) => value.trim()).filter(Boolean);
+const corsOrigin = FRONTEND_URL === '*' ? '*' : FRONTEND_URL.split(',').map(v => v.trim()).filter(Boolean);
 
 app.use(express.json());
+app.get('/', (_req, res) => res.json({ service: 'Video Call Signaling Server', status: 'online', version: '2.0.0' }));
+app.get('/health', (_req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
 
-app.get('/', (_req, res) => {
-  res.json({
-    service: 'Video Call Signaling Server',
-    status: 'online',
-    version: '1.1.0'
-  });
-});
+const io = new Server(httpServer, { cors: { origin: corsOrigin, methods: ['GET', 'POST'], credentials: true }, transports: ['websocket', 'polling'] });
+const rooms = new Map(); // code -> { host, guest, createdAt }
+const socketRooms = new Map(); // socketId -> code
+const ROOM_TTL = 30 * 60 * 1000;
 
-app.get('/health', (_req, res) => {
-  res.json({
-    status: 'ok',
-    service: 'video-call-signaling-server',
-    timestamp: new Date().toISOString()
-  });
-});
-
-const io = new Server(httpServer, {
-  cors: {
-    origin: corsOrigin,
-    methods: ['GET', 'POST'],
-    credentials: true
-  },
-  transports: ['websocket', 'polling']
-});
-
-// Demo in-memory registry. Supabase authentication/database will replace this
-// in the next phase. Media never passes through this server.
-const users = new Map(); // userId -> socketId
-const socketUsers = new Map(); // socketId -> userId
-
-function cleanUserId(value) {
-  if (typeof value !== 'string') return null;
-  const userId = value.trim().slice(0, 80);
-  return userId || null;
+function makeCode() {
+  let code;
+  do { code = String(crypto.randomInt(100000, 1000000)); } while (rooms.has(code));
+  return code;
+}
+function validCode(v) { return typeof v === 'string' && /^\d{6}$/.test(v); }
+function cleanupRoom(code) {
+  if (!rooms.has(code)) return;
+  rooms.delete(code);
+  for (const [socketId, roomCode] of socketRooms) if (roomCode === code) socketRooms.delete(socketId);
+}
+function getRoom(code) { const room = rooms.get(code); if (!room) return null; if (Date.now() - room.createdAt > ROOM_TTL) { cleanupRoom(code); return null; } return room; }
+function peerSocket(code, socketId) { const room = rooms.get(code); if (!room) return null; return room.host === socketId ? room.guest : room.host; }
+function leaveRoom(socket, notify = true) {
+  const code = socketRooms.get(socket.id);
+  if (!code) return;
+  const other = peerSocket(code, socket.id);
+  if (notify && other) io.to(other).emit('peer-left', { reason: 'The other person left the call.' });
+  cleanupRoom(code);
 }
 
-function emitToUser(userId, event, payload) {
-  const socketId = users.get(userId);
-  if (!socketId) return false;
-  io.to(socketId).emit(event, payload);
-  return true;
-}
-
-function unregister(socket) {
-  const userId = socketUsers.get(socket.id);
-  if (!userId) return;
-
-  if (users.get(userId) === socket.id) {
-    users.delete(userId);
-    io.emit('user-status', { userId, online: false });
-  }
-  socketUsers.delete(socket.id);
-}
-
-io.on('connection', (socket) => {
+io.on('connection', socket => {
   socket.emit('server-ready', { socketId: socket.id });
 
-  socket.on('register', (rawUserId, callback) => {
-    const userId = cleanUserId(rawUserId);
-    if (!userId) {
-      callback?.({ success: false, message: 'A valid user ID is required.' });
-      return;
-    }
-
-    const previousSocketId = users.get(userId);
-    if (previousSocketId && previousSocketId !== socket.id) {
-      io.to(previousSocketId).emit('session-replaced', {
-        message: 'This user ID connected from another device.'
-      });
-      io.sockets.sockets.get(previousSocketId)?.disconnect(true);
-    }
-
-    users.set(userId, socket.id);
-    socketUsers.set(socket.id, userId);
-    socket.join(`user:${userId}`);
-    socket.emit('registered', { userId, online: true });
-    io.emit('user-status', { userId, online: true });
-    callback?.({ success: true, userId });
+  socket.on('create-room', callback => {
+    if (socketRooms.has(socket.id)) leaveRoom(socket, false);
+    const code = makeCode();
+    rooms.set(code, { host: socket.id, guest: null, createdAt: Date.now() });
+    socketRooms.set(socket.id, code);
+    socket.join(`call:${code}`);
+    callback?.({ success: true, code, expiresIn: ROOM_TTL });
   });
 
-  socket.on('get-online-users', (callback) => {
-    callback?.([...users.keys()]);
+  socket.on('check-room', ({ code } = {}, callback) => {
+    const room = validCode(code) ? getRoom(code) : null;
+    callback?.(room ? { success: true, available: !room.guest } : { success: false, message: 'Call code not found or expired.' });
   });
 
-  socket.on('call-user', ({ to, callType = 'video' } = {}, callback) => {
-    const from = socketUsers.get(socket.id);
-    const target = cleanUserId(to);
-    const type = callType === 'audio' ? 'audio' : 'video';
+  socket.on('join-room', ({ code } = {}, callback) => {
+    if (!validCode(code)) return callback?.({ success: false, message: 'Enter a valid 6-digit code.' });
+    const room = getRoom(code);
+    if (!room) return callback?.({ success: false, message: 'Call code not found or expired.' });
+    if (room.guest && room.guest !== socket.id) return callback?.({ success: false, message: 'This call already has two people.' });
+    if (room.host === socket.id) return callback?.({ success: false, message: 'You cannot join your own call.' });
 
-    if (!from || !target) {
-      callback?.({ success: false, message: 'Register before starting a call.' });
-      return;
-    }
-    if (from === target) {
-      callback?.({ success: false, message: 'You cannot call yourself.' });
-      return;
-    }
-    if (!users.has(target)) {
-      socket.emit('call-failed', { reason: 'User is offline.' });
-      callback?.({ success: false, message: 'User is offline.' });
-      return;
-    }
-
-    emitToUser(target, 'incoming-call', { from, callType: type });
-    callback?.({ success: true });
+    room.guest = socket.id;
+    socketRooms.set(socket.id, code);
+    socket.join(`call:${code}`);
+    callback?.({ success: true, code, role: 'guest' });
+    io.to(room.host).emit('peer-joined', { code });
   });
 
-  socket.on('accept-call', ({ to } = {}) => {
-    const from = socketUsers.get(socket.id);
-    const target = cleanUserId(to);
-    if (from && target) emitToUser(target, 'call-accepted', { from });
+  socket.on('room-status', ({ code } = {}, callback) => {
+    const room = validCode(code) ? getRoom(code) : null;
+    callback?.(room ? { success: true, connected: Boolean(room.guest) } : { success: false, message: 'Call expired.' });
   });
 
-  socket.on('reject-call', ({ to } = {}) => {
-    const from = socketUsers.get(socket.id);
-    const target = cleanUserId(to);
-    if (from && target) emitToUser(target, 'call-rejected', { from });
-  });
-
-  socket.on('end-call', ({ to, reason = 'ended' } = {}) => {
-    const from = socketUsers.get(socket.id);
-    const target = cleanUserId(to);
-    if (from && target) emitToUser(target, 'call-ended', { from, reason });
-  });
-
-  // WebRTC signaling only. Audio/video media stays between peers (or a TURN relay).
+  // Signaling only. Camera/microphone media stays in WebRTC between browsers.
   for (const event of ['offer', 'answer', 'ice-candidate']) {
-    socket.on(event, ({ to, ...payload } = {}) => {
-      const from = socketUsers.get(socket.id);
-      const target = cleanUserId(to);
-      if (!from || !target || !payload) return;
-      emitToUser(target, event, { from, ...payload });
+    socket.on(event, ({ code, ...payload } = {}) => {
+      const room = validCode(code) ? getRoom(code) : null;
+      if (!room || socketRooms.get(socket.id) !== code) return;
+      const other = peerSocket(code, socket.id);
+      if (other) io.to(other).emit(event, payload);
     });
   }
 
-  socket.on('disconnect', () => unregister(socket));
+  socket.on('end-call', ({ code } = {}) => {
+    const room = validCode(code) ? getRoom(code) : null;
+    if (!room || socketRooms.get(socket.id) !== code) return;
+    const other = peerSocket(code, socket.id);
+    if (other) io.to(other).emit('call-ended', { reason: 'Call ended.' });
+    cleanupRoom(code);
+  });
+
+  socket.on('disconnect', () => leaveRoom(socket, true));
 });
 
-httpServer.listen(PORT, '0.0.0.0', () => {
-  console.log(`Video call signaling server running on port ${PORT}`);
-  console.log(`Allowed frontend origin: ${FRONTEND_URL}`);
-});
+setInterval(() => { for (const [code, room] of rooms) if (Date.now() - room.createdAt > ROOM_TTL) cleanupRoom(code); }, 60_000).unref();
+
+httpServer.listen(PORT, '0.0.0.0', () => console.log(`Video call signaling server listening on ${PORT}`));
