@@ -18,9 +18,7 @@ const cameraBtn = document.querySelector('#cameraBtn');
 const endBtn = document.querySelector('#endBtn');
 
 const rtcConfig = {
-  iceServers: [
-    { urls: 'stun:stun.l.google.com:19302' }
-  ]
+  iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
 };
 
 let myId = '';
@@ -35,9 +33,8 @@ function setStatus(message) {
 }
 
 async function requestMedia(type) {
-  const video = type === 'video';
   return navigator.mediaDevices.getUserMedia({
-    video,
+    video: type === 'video',
     audio: true
   });
 }
@@ -60,11 +57,9 @@ function createPeerConnection(targetUserId) {
   };
 
   peerConnection.onconnectionstatechange = () => {
+    if (!peerConnection) return;
     setStatus(`Call connection: ${peerConnection.connectionState}`);
-    if (['failed', 'closed', 'disconnected'].includes(peerConnection.connectionState)) {
-      // Keep cleanup centralized so both users can safely end/restart a call.
-      if (peerConnection.connectionState !== 'disconnected') cleanupCall();
-    }
+    if (peerConnection.connectionState === 'failed') cleanupCall(false);
   };
 
   if (localStream) {
@@ -155,8 +150,8 @@ async function handleIceCandidate({ candidate }) {
   }
 }
 
-function cleanupCall() {
-  if (peerId) socket.emit('end-call', { to: peerId });
+function cleanupCall(notifyPeer = true) {
+  if (notifyPeer && peerId) socket.emit('end-call', { to: peerId });
   peerConnection?.close();
   peerConnection = null;
   localStream?.getTracks().forEach(track => track.stop());
@@ -180,7 +175,7 @@ videoCallBtn.addEventListener('click', () => startCall('video'));
 audioCallBtn.addEventListener('click', () => startCall('audio'));
 acceptBtn.addEventListener('click', acceptCall);
 rejectBtn.addEventListener('click', rejectCall);
-endBtn.addEventListener('click', cleanupCall);
+endBtn.addEventListener('click', () => cleanupCall(true));
 
 muteBtn.addEventListener('click', () => {
   const track = localStream?.getAudioTracks()[0];
@@ -218,13 +213,13 @@ socket.on('call-accepted', async ({ from }) => {
 });
 
 socket.on('call-rejected', ({ from }) => {
+  cleanupCall(false);
   setStatus(`${from} rejected the call.`);
-  cleanupCall();
 });
 
 socket.on('call-failed', ({ reason }) => {
+  cleanupCall(false);
   setStatus(reason || 'Call failed.');
-  cleanupCall();
 });
 
 socket.on('offer', handleOffer);
@@ -232,11 +227,6 @@ socket.on('answer', handleAnswer);
 socket.on('ice-candidate', handleIceCandidate);
 
 socket.on('call-ended', () => {
+  cleanupCall(false);
   setStatus('The other user ended the call.');
-  cleanupCall();
-});
-
-socket.on('user-status', ({ userId, online }) => {
-  if (userId !== myId) return;
-  if (!online) setStatus('Offline');
 });
