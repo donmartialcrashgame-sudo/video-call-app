@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Video Call</title>
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+  <main class="app">
+    <section class="card setup-card">
+      <h1>📹 Video Call</h1>
+      <p class="muted">WebRTC calling foundation</p>
+
+      <label for="myId">Your user ID</label>
+      <input id="myId" placeholder="e.g. don" autocomplete="off">
+
+      <label for="peerId">Call user ID</label>
+      <input id="peerId" placeholder="e.g. john" autocomplete="off">
+
+      <div class="actions">
+        <button id="registerBtn">Go Online</button>
+        <button id="videoCallBtn" disabled>📹 Video Call</button>
+        <button id="audioCallBtn" disabled>🎤 Audio Call</button>
+      </div>
+
+      <p id="status" class="status">Offline</p>
+    </section>
+
+    <section class="call-card" id="callCard" hidden>
+      <div class="video-grid">
+        <video id="remoteVideo" autoplay playsinline></video>
+        <video id="localVideo" autoplay muted playsinline></video>
+      </div>
+
+      <div class="call-controls">
+        <button id="muteBtn">🎤 Mute</button>
+        <button id="cameraBtn">📷 Camera Off</button>
+        <button id="endBtn" class="danger">☎ End Call</button>
+      </div>
+    </section>
+  </main>
+
+  <div class="incoming" id="incomingCall" hidden>
+    <div class="incoming-box">
+      <div class="avatar">📞</div>
+      <h2 id="incomingTitle">Incoming call</h2>
+      <p id="incomingText"></p>
+      <div class="actions">
+        <button id="acceptBtn">Accept</button>
+        <button id="rejectBtn" class="danger">Reject</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="/js/call.js" type="module"></script>
+</body>
+</html>
