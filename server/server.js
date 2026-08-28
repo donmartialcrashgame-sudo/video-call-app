@@ -11,27 +11,43 @@ const FRONTEND_URL = process.env.FRONTEND_URL || '*';
 const corsOrigin = FRONTEND_URL === '*' ? '*' : FRONTEND_URL.split(',').map(v => v.trim()).filter(Boolean);
 
 app.use(express.json());
-app.get('/', (_req, res) => res.json({ service: 'Video Call Signaling Server', status: 'online', version: '2.0.0' }));
+app.get('/', (_req, res) => res.json({ service: 'Video Call Signaling Server', status: 'online', version: '2.0.1' }));
 app.get('/health', (_req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
 
-const io = new Server(httpServer, { cors: { origin: corsOrigin, methods: ['GET', 'POST'], credentials: true }, transports: ['websocket', 'polling'] });
-const rooms = new Map(); // code -> { host, guest, createdAt }
-const socketRooms = new Map(); // socketId -> code
+const io = new Server(httpServer, {
+  cors: { origin: corsOrigin, methods: ['GET', 'POST'], credentials: true },
+  transports: ['websocket', 'polling']
+});
+
+const rooms = new Map();
+const socketRooms = new Map();
 const ROOM_TTL = 30 * 60 * 1000;
 
 function makeCode() {
   let code;
-  do { code = String(crypto.randomInt(100000, 1000000)); } while (rooms.has(code));
+  do code = String(crypto.randomInt(100000, 1000000)); while (rooms.has(code));
   return code;
 }
 function validCode(v) { return typeof v === 'string' && /^\d{6}$/.test(v); }
+function reply(callback, payload) { if (typeof callback === 'function') callback(payload); }
 function cleanupRoom(code) {
-  if (!rooms.has(code)) return;
+  const room = rooms.get(code);
+  if (!room) return;
   rooms.delete(code);
-  for (const [socketId, roomCode] of socketRooms) if (roomCode === code) socketRooms.delete(socketId);
+  if (room.host) socketRooms.delete(room.host);
+  if (room.guest) socketRooms.delete(room.guest);
 }
-function getRoom(code) { const room = rooms.get(code); if (!room) return null; if (Date.now() - room.createdAt > ROOM_TTL) { cleanupRoom(code); return null; } return room; }
-function peerSocket(code, socketId) { const room = rooms.get(code); if (!room) return null; return room.host === socketId ? room.guest : room.host; }
+function getRoom(code) {
+  const room = rooms.get(code);
+  if (!room) return null;
+  if (Date.now() - room.createdAt > ROOM_TTL) { cleanupRoom(code); return null; }
+  return room;
+}
+function peerSocket(code, socketId) {
+  const room = rooms.get(code);
+  if (!room) return null;
+  return room.host === socketId ? room.guest : room.host;
+}
 function leaveRoom(socket, notify = true) {
   const code = socketRooms.get(socket.id);
   if (!code) return;
@@ -43,50 +59,64 @@ function leaveRoom(socket, notify = true) {
 io.on('connection', socket => {
   socket.emit('server-ready', { socketId: socket.id });
 
-  socket.on('create-room', callback => {
+  socket.on('create-room', (...args) => {
+    const callback = typeof args[args.length - 1] === 'function' ? args.pop() : null;
     if (socketRooms.has(socket.id)) leaveRoom(socket, false);
     const code = makeCode();
     rooms.set(code, { host: socket.id, guest: null, createdAt: Date.now() });
     socketRooms.set(socket.id, code);
     socket.join(`call:${code}`);
-    callback?.({ success: true, code, expiresIn: ROOM_TTL });
+    reply(callback, { success: true, code, expiresIn: ROOM_TTL });
   });
 
-  socket.on('check-room', ({ code } = {}, callback) => {
-    const room = validCode(code) ? getRoom(code) : null;
-    callback?.(room ? { success: true, available: !room.guest } : { success: false, message: 'Call code not found or expired.' });
+  socket.on('check-room', (...args) => {
+    const callback = typeof args[args.length - 1] === 'function' ? args.pop() : null;
+    const data = args[0] || {};
+    const room = validCode(data.code) ? getRoom(data.code) : null;
+    reply(callback, room && !room.guest
+      ? { success: true, available: true }
+      : { success: false, message: room ? 'This call already has two people.' : 'Call code not found or expired.' });
   });
 
-  socket.on('join-room', ({ code } = {}, callback) => {
-    if (!validCode(code)) return callback?.({ success: false, message: 'Enter a valid 6-digit code.' });
+  socket.on('join-room', (...args) => {
+    const callback = typeof args[args.length - 1] === 'function' ? args.pop() : null;
+    const data = args[0] || {};
+    const code = data.code;
+    if (!validCode(code)) return reply(callback, { success: false, message: 'Enter a valid 6-digit code.' });
     const room = getRoom(code);
-    if (!room) return callback?.({ success: false, message: 'Call code not found or expired.' });
-    if (room.guest && room.guest !== socket.id) return callback?.({ success: false, message: 'This call already has two people.' });
-    if (room.host === socket.id) return callback?.({ success: false, message: 'You cannot join your own call.' });
+    if (!room) return reply(callback, { success: false, message: 'Call code not found or expired.' });
+    if (room.host === socket.id) return reply(callback, { success: false, message: 'You cannot join your own call.' });
+    if (room.guest && room.guest !== socket.id) return reply(callback, { success: false, message: 'This call already has two people.' });
 
     room.guest = socket.id;
     socketRooms.set(socket.id, code);
     socket.join(`call:${code}`);
-    callback?.({ success: true, code, role: 'guest' });
+    reply(callback, { success: true, code, role: 'guest' });
     io.to(room.host).emit('peer-joined', { code });
   });
 
-  socket.on('room-status', ({ code } = {}, callback) => {
-    const room = validCode(code) ? getRoom(code) : null;
-    callback?.(room ? { success: true, connected: Boolean(room.guest) } : { success: false, message: 'Call expired.' });
+  socket.on('room-status', (...args) => {
+    const callback = typeof args[args.length - 1] === 'function' ? args.pop() : null;
+    const data = args[0] || {};
+    const room = validCode(data.code) ? getRoom(data.code) : null;
+    reply(callback, room ? { success: true, connected: Boolean(room.guest) } : { success: false, message: 'Call expired.' });
   });
 
-  // Signaling only. Camera/microphone media stays in WebRTC between browsers.
   for (const event of ['offer', 'answer', 'ice-candidate']) {
-    socket.on(event, ({ code, ...payload } = {}) => {
+    socket.on(event, data => {
+      const payload = data || {};
+      const code = payload.code;
       const room = validCode(code) ? getRoom(code) : null;
       if (!room || socketRooms.get(socket.id) !== code) return;
       const other = peerSocket(code, socket.id);
-      if (other) io.to(other).emit(event, payload);
+      if (!other) return;
+      const { code: _code, ...signal } = payload;
+      io.to(other).emit(event, signal);
     });
   }
 
-  socket.on('end-call', ({ code } = {}) => {
+  socket.on('end-call', data => {
+    const code = data?.code;
     const room = validCode(code) ? getRoom(code) : null;
     if (!room || socketRooms.get(socket.id) !== code) return;
     const other = peerSocket(code, socket.id);
@@ -97,6 +127,10 @@ io.on('connection', socket => {
   socket.on('disconnect', () => leaveRoom(socket, true));
 });
 
-setInterval(() => { for (const [code, room] of rooms) if (Date.now() - room.createdAt > ROOM_TTL) cleanupRoom(code); }, 60_000).unref();
+setInterval(() => {
+  for (const [code, room] of rooms) if (Date.now() - room.createdAt > ROOM_TTL) cleanupRoom(code);
+}, 60_000).unref();
 
-httpServer.listen(PORT, '0.0.0.0', () => console.log(`Video call signaling server listening on ${PORT}`));
+httpServer.listen(PORT, '0.0.0.0', () => {
+  console.log(`Video call signaling server listening on ${PORT}`);
+});
