@@ -1,12 +1,12 @@
 {
   "name": "video-call-app",
-  "version": "1.0.0",
-  "description": "One-to-one WebRTC video calling app with Node.js and Socket.IO",
+  "version": "1.1.0",
+  "description": "Shop Camzon WebRTC voice and video call signaling server",
   "type": "module",
-  "main": "server/server.js",
+  "main": "server/server-care.js",
   "scripts": {
-    "start": "node server/server.js",
-    "dev": "node --watch server/server.js"
+    "start": "node server/server-care.js",
+    "dev": "node --watch server/server-care.js"
   },
   "dependencies": {
     "dotenv": "^16.4.7",
